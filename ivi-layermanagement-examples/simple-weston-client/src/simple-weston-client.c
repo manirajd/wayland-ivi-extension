@@ -79,6 +79,7 @@ typedef struct _WaylandContext {
     struct wl_cursor        *cursor;
     void                    *bkgnddata;
     uint32_t                formats;
+    int                     cursor_enable;
 #ifdef LIBWESTON_DEBUG_PROTOCOL
     struct weston_debug_v1  *debug_iface;
     struct wl_list          stream_list;
@@ -110,20 +111,34 @@ get_bkgnd_settings(void)
     char *end;
     int len;
 
+    /*if no environment variable given return NULL*/
+    option = getenv("IVI_CLIENT_SURFACE_ID");
+    if(NULL == option)
+        return NULL;
+
     bkgnd_settings =
             (BkGndSettingsStruct*)calloc(1, sizeof(BkGndSettingsStruct));
 
-    option = getenv("IVI_CLIENT_SURFACE_ID");
-    if(option)
-        bkgnd_settings->surface_id = strtol(option, &end, 0);
-    else
-        bkgnd_settings->surface_id = 10;
-
+    bkgnd_settings->surface_id = strtol(option, &end, 0);
     bkgnd_settings->surface_width = 1;
     bkgnd_settings->surface_height = 1;
     bkgnd_settings->surface_stride = bkgnd_settings->surface_width * 4;
 
     return bkgnd_settings;
+}
+
+static int
+get_cursor_enable(void)
+{
+    char *option;
+    char *end;
+    int cursor_enable = 0;
+
+    option = getenv("IVI_CLIENT_CURSOR_ENABLE");
+    if(option)
+        cursor_enable = strtol(option, &end, 0);
+
+    return cursor_enable;
 }
 
 #ifdef LIBWESTON_DEBUG_PROTOCOL
@@ -388,24 +403,32 @@ registry_handle_global(void *data, struct wl_registry *registry, uint32_t name,
     WaylandContextStruct* wlcontext = (WaylandContextStruct*)data;
 
     if (!strcmp(interface, "wl_compositor")) {
-        wlcontext->wl_compositor =
-                wl_registry_bind(registry, name,
-                                 &wl_compositor_interface, 1);
+        if (wlcontext->bkgnd_settings) {
+            wlcontext->wl_compositor =
+                    wl_registry_bind(registry, name,
+                                     &wl_compositor_interface, 1);
+        }
     }
     else if (!strcmp(interface, "wl_shm")) {
-        wlcontext->wl_shm =
-                wl_registry_bind(registry, name, &wl_shm_interface, 1);
-        wl_shm_add_listener(wlcontext->wl_shm, &shm_listenter, wlcontext);
+        if (wlcontext->bkgnd_settings) {
+            wlcontext->wl_shm =
+                    wl_registry_bind(registry, name, &wl_shm_interface, 1);
+            wl_shm_add_listener(wlcontext->wl_shm, &shm_listenter, wlcontext);
+        }
     }
     else if (!strcmp(interface, "ivi_application")) {
-        wlcontext->ivi_application =
-                wl_registry_bind(registry, name,
-                                 &ivi_application_interface, 1);
+        if (wlcontext->bkgnd_settings) {
+            wlcontext->ivi_application =
+                    wl_registry_bind(registry, name,
+                                     &ivi_application_interface, 1);
+        }
     }
     else if (!strcmp(interface, "wl_seat")) {
-        wlcontext->wl_seat =
-                wl_registry_bind(registry, name, &wl_seat_interface, 1);
-        wl_seat_add_listener(wlcontext->wl_seat, &seat_Listener, data);
+        if (wlcontext->bkgnd_settings && wlcontext->cursor_enable) {
+            wlcontext->wl_seat =
+                    wl_registry_bind(registry, name, &wl_seat_interface, 1);
+            wl_seat_add_listener(wlcontext->wl_seat, &seat_Listener, data);
+        }
     }
 #ifdef LIBWESTON_DEBUG_PROTOCOL
     else if (!strcmp(interface, weston_debug_v1_interface.name)) {
@@ -447,14 +470,16 @@ int init_wayland_context(WaylandContextStruct* wlcontext)
                              &registry_listener, wlcontext);
     wl_display_roundtrip(wlcontext->wl_display);
 
-    if (wlcontext->wl_shm == NULL) {
+    if (wlcontext->bkgnd_settings &&
+        (wlcontext->wl_shm == NULL)) {
         fprintf(stderr, "No wl_shm global\n");
         return -1;
     }
 
     wl_display_roundtrip(wlcontext->wl_display);
 
-    if (!(wlcontext->formats & (1 << WL_SHM_FORMAT_XRGB8888))) {
+    if (wlcontext->bkgnd_settings &&
+        !(wlcontext->formats & (1 << WL_SHM_FORMAT_XRGB8888))) {
         fprintf(stderr, "WL_SHM_FORMAT_XRGB32 not available\n");
         return -1;
     }
@@ -475,13 +500,25 @@ void destroy_wayland_context(WaylandContextStruct* wlcontext)
     if(wlcontext->wl_compositor)
         wl_compositor_destroy(wlcontext->wl_compositor);
 
-    if(wlcontext->wl_display)
-        wl_display_disconnect(wlcontext->wl_display);
+    if(wlcontext->ivi_application)
+        ivi_application_destroy(wlcontext->ivi_application);
+
+    if(wlcontext->wl_shm)
+        wl_shm_destroy(wlcontext->wl_shm);
+
+    if(wlcontext->wl_seat)
+        wl_seat_destroy(wlcontext->wl_seat);
 
 #ifdef LIBWESTON_DEBUG_PROTOCOL
     if(wlcontext->debug_iface)
         weston_debug_v1_destroy(wlcontext->debug_iface);
 #endif
+
+    if(wlcontext->wl_registry)
+        wl_registry_destroy(wlcontext->wl_registry);
+
+    if(wlcontext->wl_display)
+        wl_display_disconnect(wlcontext->wl_display);
 }
 
 int
@@ -746,12 +783,15 @@ int main (int argc, const char * argv[])
     sigaction(SIGTERM, &sigint, NULL);
     sigaction(SIGSEGV, &sigint, NULL);
 
-    /*get bkgnd settings and create shm-surface*/
+    /*get bkgnd settings if available*/
     bkgnd_settings = get_bkgnd_settings();
 
     /*init wayland context*/
     wlcontext = (WaylandContextStruct*)calloc(1, sizeof(WaylandContextStruct));
     wlcontext->bkgnd_settings = bkgnd_settings;
+
+    /*check cursor is enabled*/
+    wlcontext->cursor_enable = get_cursor_enable();
 
 #ifdef LIBWESTON_DEBUG_PROTOCOL
     /*init debug stream list*/
@@ -767,7 +807,7 @@ int main (int argc, const char * argv[])
         return -1;
     }
 
-    if (create_bkgnd_surface(wlcontext)) {
+    if (wlcontext->bkgnd_settings && create_bkgnd_surface(wlcontext)) {
         fprintf(stderr, "create_bkgnd_surface failed\n");
         goto Error;
     }
@@ -793,7 +833,8 @@ int main (int argc, const char * argv[])
 #endif
 
     /*draw the bkgnd display*/
-    draw_bkgnd_surface(wlcontext);
+    if (wlcontext->bkgnd_settings)
+        draw_bkgnd_surface(wlcontext);
 
     while (running && (ret != -1))
         ret = display_dispatch(wlcontext->wl_display);
@@ -813,10 +854,13 @@ Error:
     }
 #endif
 
-    destroy_bkgnd_surface(wlcontext);
+    if (wlcontext->bkgnd_settings)
+        destroy_bkgnd_surface(wlcontext);
     destroy_wayland_context(wlcontext);
 
-    free(bkgnd_settings);
+    if (bkgnd_settings)
+        free(bkgnd_settings);
+
     free(wlcontext);
 
     return 0;
